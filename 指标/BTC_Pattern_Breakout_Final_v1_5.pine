@@ -1,0 +1,750 @@
+//@version=6
+indicator(
+     "BTC Pattern Breakout Final v1.5",
+     overlay = true,
+     max_labels_count = 150,
+     max_lines_count = 150,
+     max_bars_back = 500
+)
+
+// ==========================
+// 1. 基础设置
+// ==========================
+groupBase = "基础设置"
+
+btcOnly = input.bool(true, "只在BTC上触发", group = groupBase)
+
+tradeMode = input.string(
+     "W底 + 收敛突破",
+     "多头交易模式",
+     options = ["W底 + 收敛突破", "只做W底突破", "只做收敛突破"],
+     group = groupBase
+)
+
+enableShortModels = input.bool(true, "启用空头模型：M顶/收敛跌破", group = groupBase)
+enableMTop = input.bool(true, "启用M顶跌破", group = groupBase)
+enableCompressionDown = input.bool(true, "启用收敛跌破", group = groupBase)
+
+showLevels = input.bool(true, "显示关键突破/跌破线", group = groupBase)
+showFake = input.bool(true, "显示假突破提醒", group = groupBase)
+showFakeBreakdown = input.bool(true, "显示假跌破提醒", group = groupBase)
+showFakeReference = input.bool(false, "显示假突破/假跌破参考线", group = groupBase)
+showTable = input.bool(false, "显示右上角状态面板", group = groupBase)
+
+isBTC = not btcOnly or str.contains(str.upper(syminfo.ticker), "BTC")
+
+useW = tradeMode == "W底 + 收敛突破" or tradeMode == "只做W底突破"
+useCompression = tradeMode == "W底 + 收敛突破" or tradeMode == "只做收敛突破"
+
+// ==========================
+// 2. 成交量过滤
+// ==========================
+groupVol = "成交量过滤"
+
+volLen = input.int(20, "成交量均线周期", minval = 5, group = groupVol)
+volMult = input.float(1.3, "放量倍数", minval = 1.0, step = 0.1, group = groupVol)
+
+volMA = ta.sma(volume, volLen)
+volOk = not na(volMA) and volume >= volMA * volMult
+
+// ==========================
+// 3. ATR 动能过滤
+// ==========================
+groupATR = "ATR过滤"
+
+atrLen = input.int(14, "ATR周期", minval = 5, group = groupATR)
+atrMaLen = input.int(14, "ATR均线周期", minval = 5, group = groupATR)
+atrCompareBars = input.int(3, "ATR对比前N根K线", minval = 1, group = groupATR)
+atrMinRisePct = input.float(2.0, "ATR最小上升百分比", minval = 0.0, step = 0.5, group = groupATR)
+
+atr = ta.atr(atrLen)
+atrMA = ta.sma(atr, atrMaLen)
+
+atrPrev = atr[atrCompareBars]
+atrRisePct = not na(atrPrev) and atrPrev != 0 ? (atr - atrPrev) / atrPrev * 100 : na
+
+atrOk = not na(atrRisePct) and atr > atrMA and atrRisePct >= atrMinRisePct
+
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+bodySize = math.abs(close - open)
+
+// ==========================
+// 4. OI 过滤
+// ==========================
+groupOI = "OI过滤"
+
+useOI = input.bool(true, "启用OI过滤", group = groupOI)
+oiSymbol = input.symbol("BINANCE:BTCUSDT.P_OI", "BTC OI数据源", group = groupOI)
+oiLookback = input.int(3, "OI对比前N根K线", minval = 1, group = groupOI)
+oiMinRise = input.float(0.1, "OI最小健康上升%", step = 0.1, group = groupOI)
+oiMaxRise = input.float(6.0, "OI最大健康上升%", step = 0.5, group = groupOI)
+
+oi = request.security(
+     oiSymbol,
+     timeframe.period,
+     close,
+     ignore_invalid_symbol = true,
+     lookahead = barmerge.lookahead_off
+)
+
+oiPrev = oi[oiLookback]
+oiChangePct = not na(oi) and not na(oiPrev) and oiPrev != 0 ? (oi - oiPrev) / oiPrev * 100 : na
+
+oiOk = not useOI or (not na(oiChangePct) and oiChangePct >= oiMinRise and oiChangePct <= oiMaxRise)
+oiSpikeBad = useOI and not na(oiChangePct) and oiChangePct > oiMaxRise
+
+// ==========================
+// 5. 大周期趋势过滤，可选
+// ==========================
+groupTrend = "趋势过滤"
+
+useTrendFilter = input.bool(false, "启用大周期趋势过滤", group = groupTrend)
+trendTF = input.timeframe("60", "趋势周期", group = groupTrend)
+trendEmaLen = input.int(200, "趋势EMA周期", minval = 20, group = groupTrend)
+
+htfClose = request.security(
+     syminfo.tickerid,
+     trendTF,
+     close,
+     lookahead = barmerge.lookahead_off
+)
+
+htfEma = request.security(
+     syminfo.tickerid,
+     trendTF,
+     ta.ema(close, trendEmaLen),
+     lookahead = barmerge.lookahead_off
+)
+
+trendOk = not useTrendFilter or (not na(htfClose) and not na(htfEma) and htfClose > htfEma)
+trendDownOk = not useTrendFilter or (not na(htfClose) and not na(htfEma) and htfClose < htfEma)
+
+// ==========================
+// 6. 共振确认条件
+// ==========================
+groupConfirm = "共振确认"
+
+minConfirm = input.int(2, "最少确认数量", minval = 1, maxval = 4, group = groupConfirm)
+
+// 多头确认
+int confirmScore = 0
+int confirmTotal = 0
+
+confirmTotal += 1
+confirmScore += volOk ? 1 : 0
+
+confirmTotal += 1
+confirmScore += atrOk ? 1 : 0
+
+if useOI
+    confirmTotal += 1
+    confirmScore += oiOk ? 1 : 0
+
+if useTrendFilter
+    confirmTotal += 1
+    confirmScore += trendOk ? 1 : 0
+
+confirmPassed = confirmScore >= minConfirm
+
+// 空头确认
+int confirmScoreShort = 0
+int confirmTotalShort = 0
+
+confirmTotalShort += 1
+confirmScoreShort += volOk ? 1 : 0
+
+confirmTotalShort += 1
+confirmScoreShort += atrOk ? 1 : 0
+
+if useOI
+    confirmTotalShort += 1
+    confirmScoreShort += oiOk ? 1 : 0
+
+if useTrendFilter
+    confirmTotalShort += 1
+    confirmScoreShort += trendDownOk ? 1 : 0
+
+confirmPassedShort = confirmScoreShort >= minConfirm
+
+// ==========================
+// 7. W底模型
+// 默认适合 BTC 15min 短线结构
+// ==========================
+groupW = "W底模型"
+
+pivotLen = input.int(3, "摆动低点确认K线", minval = 2, maxval = 10, group = groupW)
+wMinGap = input.int(8, "两个底最小间隔", minval = 3, group = groupW)
+wMaxGap = input.int(60, "两个底最大间隔", minval = 10, maxval = 200, group = groupW)
+wLowTolerancePct = input.float(0.8, "两个底允许误差%", minval = 0.1, step = 0.1, group = groupW)
+wNeckMinHeightPct = input.float(0.4, "颈线至少高于底部%", minval = 0.1, step = 0.1, group = groupW)
+wExpireBars = input.int(48, "W底有效期K线数", minval = 10, group = groupW)
+
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float low1Price = na
+var int low1Bar = na
+var float low2Price = na
+var int low2Bar = na
+
+var float wNeckline = na
+var bool wReady = false
+var int wExpireBar = na
+
+if not na(pl)
+    low1Price := low2Price
+    low1Bar := low2Bar
+
+    low2Price := pl
+    low2Bar := bar_index - pivotLen
+
+    if not na(low1Price) and not na(low1Bar)
+        gap = low2Bar - low1Bar
+        avgLow = (low1Price + low2Price) / 2.0
+        lowDiffPct = math.abs(low2Price - low1Price) / avgLow * 100
+
+        if gap >= wMinGap and gap <= wMaxGap and lowDiffPct <= wLowTolerancePct
+            float nh = na
+
+            for i = 0 to 200
+                inRange = i >= (bar_index - low2Bar) and i <= (bar_index - low1Bar)
+                if inRange and not na(high[i])
+                    nh := na(nh) ? high[i] : math.max(nh, high[i])
+
+            minNeck = math.max(low1Price, low2Price) * (1 + wNeckMinHeightPct / 100)
+
+            if not na(nh) and nh > minNeck
+                wNeckline := nh
+                wReady := true
+                wExpireBar := bar_index + wExpireBars
+
+if wReady and not na(wExpireBar) and bar_index > wExpireBar
+    wReady := false
+    wNeckline := na
+
+wBreakRaw = useW and wReady and not na(wNeckline) and close > wNeckline and close[1] <= wNeckline
+
+// ==========================
+// 8. 收敛模型：上破/下破共用
+// 默认约识别 6小时左右结构：12 + 12 根15min K线
+// ==========================
+groupC = "收敛突破/跌破模型"
+
+compressHalfLen = input.int(12, "收敛半周期", minval = 5, maxval = 50, group = groupC)
+rangeShrinkMult = input.float(0.85, "区间收缩比例", minval = 0.5, maxval = 1.0, step = 0.05, group = groupC)
+atrQuietMult = input.float(1.05, "收敛期ATR上限倍数", minval = 0.5, step = 0.05, group = groupC)
+
+prevHigh = ta.highest(high[compressHalfLen], compressHalfLen)
+recentHigh = ta.highest(high[1], compressHalfLen)
+
+prevLow = ta.lowest(low[compressHalfLen], compressHalfLen)
+recentLow = ta.lowest(low[1], compressHalfLen)
+
+prevRange = prevHigh - prevLow
+recentRange = recentHigh - recentLow
+
+lowerHighs = recentHigh < prevHigh
+higherLows = recentLow > prevLow
+rangeContracting = not na(prevRange) and not na(recentRange) and recentRange < prevRange * rangeShrinkMult
+atrQuiet = atr[1] <= atrMA[1] * atrQuietMult
+
+compressionSetup = lowerHighs and higherLows and rangeContracting and atrQuiet
+compressionUpper = recentHigh
+compressionLower = recentLow
+
+compressionBreakRaw = useCompression and compressionSetup and close > compressionUpper and close[1] <= compressionUpper
+
+compressionDownBreakRaw = enableShortModels and enableCompressionDown and compressionSetup and close < compressionLower and close[1] >= compressionLower
+
+// ==========================
+// 9. M顶模型
+// 默认参数镜像W底，不改变原W底参数
+// ==========================
+groupM = "M顶模型"
+
+mPivotLen = input.int(3, "摆动高点确认K线", minval = 2, maxval = 10, group = groupM)
+mMinGap = input.int(8, "两个顶最小间隔", minval = 3, group = groupM)
+mMaxGap = input.int(60, "两个顶最大间隔", minval = 10, maxval = 200, group = groupM)
+mHighTolerancePct = input.float(0.8, "两个顶允许误差%", minval = 0.1, step = 0.1, group = groupM)
+mNeckMinDepthPct = input.float(0.4, "颈线至少低于顶部%", minval = 0.1, step = 0.1, group = groupM)
+mExpireBars = input.int(48, "M顶有效期K线数", minval = 10, group = groupM)
+
+ph = ta.pivothigh(high, mPivotLen, mPivotLen)
+
+var float high1Price = na
+var int high1Bar = na
+var float high2Price = na
+var int high2Bar = na
+
+var float mNeckline = na
+var bool mReady = false
+var int mExpireBar = na
+
+if not na(ph)
+    high1Price := high2Price
+    high1Bar := high2Bar
+
+    high2Price := ph
+    high2Bar := bar_index - mPivotLen
+
+    if not na(high1Price) and not na(high1Bar)
+        gapM = high2Bar - high1Bar
+        avgHigh = (high1Price + high2Price) / 2.0
+        highDiffPct = math.abs(high2Price - high1Price) / avgHigh * 100
+
+        if gapM >= mMinGap and gapM <= mMaxGap and highDiffPct <= mHighTolerancePct
+            float nl = na
+
+            for i = 0 to 200
+                inRangeM = i >= (bar_index - high2Bar) and i <= (bar_index - high1Bar)
+                if inRangeM and not na(low[i])
+                    nl := na(nl) ? low[i] : math.min(nl, low[i])
+
+            maxNeck = math.min(high1Price, high2Price) * (1 - mNeckMinDepthPct / 100)
+
+            if not na(nl) and nl < maxNeck
+                mNeckline := nl
+                mReady := true
+                mExpireBar := bar_index + mExpireBars
+
+if mReady and not na(mExpireBar) and bar_index > mExpireBar
+    mReady := false
+    mNeckline := na
+
+mBreakRaw = enableShortModels and enableMTop and mReady and not na(mNeckline) and close < mNeckline and close[1] >= mNeckline
+
+// ==========================
+// 10. 假突破模型：保留原版清晰逻辑
+// 逻辑：扫前高 → 收盘跌回 → 动能/成交/OI不配合
+// ==========================
+groupFake = "假突破模型：清晰版"
+
+fakeLookback = input.int(
+     20,
+     "假突破前高回看K线数",
+     minval = 5,
+     maxval = 100,
+     group = groupFake
+)
+
+fakeMode = input.string(
+     "即时",
+     "假突破标记方式",
+     options = ["即时", "确认后"],
+     group = groupFake
+)
+
+fakeConfirmBars = input.int(
+     1,
+     "确认等待K线数",
+     minval = 1,
+     maxval = 3,
+     group = groupFake
+)
+
+fakeMinBadFactors = input.int(
+     1,
+     "最少危险条件数量",
+     minval = 1,
+     maxval = 4,
+     group = groupFake
+)
+
+fakeCooldownBars = input.int(
+     8,
+     "假突破冷却K线数",
+     minval = 1,
+     maxval = 50,
+     group = groupFake
+)
+
+fakeWickBodyRatio = input.float(
+     1.0,
+     "上影线/实体最小比例",
+     minval = 0.1,
+     step = 0.1,
+     group = groupFake
+)
+
+fakeMinWickAtr = input.float(
+     0.15,
+     "最小上影线ATR倍数",
+     minval = 0.0,
+     step = 0.05,
+     group = groupFake
+)
+
+fakeResistance = ta.highest(high[1], fakeLookback)
+
+fakeSweptHigh = high > fakeResistance
+fakeFailedClose = close < fakeResistance
+
+fakeWickReject = upperWick >= atr * fakeMinWickAtr and upperWick >= bodySize * fakeWickBodyRatio
+
+int fakeBadCount = 0
+fakeBadCount += not volOk ? 1 : 0
+fakeBadCount += not atrOk ? 1 : 0
+fakeBadCount += oiSpikeBad ? 1 : 0
+fakeBadCount += fakeWickReject ? 1 : 0
+
+fakeSetupRaw = showFake and isBTC and barstate.isconfirmed and
+     fakeSweptHigh and
+     fakeFailedClose and
+     fakeBadCount >= fakeMinBadFactors
+
+fakeLevelRaw = fakeSetupRaw ? fakeResistance : na
+
+fakeInstant = fakeSetupRaw
+
+fakeConfirmed = fakeSetupRaw[fakeConfirmBars] and
+     not na(fakeLevelRaw[fakeConfirmBars]) and
+     close < fakeLevelRaw[fakeConfirmBars] and
+     low < low[fakeConfirmBars]
+
+var int lastFakeBar = na
+fakeCooldownOk = na(lastFakeBar) or bar_index - lastFakeBar > fakeCooldownBars
+
+fakeBreakout = showFake and fakeCooldownOk and (
+     fakeMode == "即时" ? fakeInstant : fakeConfirmed
+)
+
+if fakeBreakout
+    lastFakeBar := bar_index
+
+// ==========================
+// 11. 假跌破模型：新增
+// 逻辑：扫前低 → 收盘收回 → 动能/成交/OI不配合
+// 用于过滤M顶跌破/收敛跌破里的诱空
+// ==========================
+groupFakeDown = "假跌破模型"
+
+fakeDownLookback = input.int(
+     20,
+     "假跌破前低回看K线数",
+     minval = 5,
+     maxval = 100,
+     group = groupFakeDown
+)
+
+fakeDownMode = input.string(
+     "即时",
+     "假跌破标记方式",
+     options = ["即时", "确认后"],
+     group = groupFakeDown
+)
+
+fakeDownConfirmBars = input.int(
+     1,
+     "确认等待K线数",
+     minval = 1,
+     maxval = 3,
+     group = groupFakeDown
+)
+
+fakeDownMinBadFactors = input.int(
+     1,
+     "最少危险条件数量",
+     minval = 1,
+     maxval = 4,
+     group = groupFakeDown
+)
+
+fakeDownCooldownBars = input.int(
+     8,
+     "假跌破冷却K线数",
+     minval = 1,
+     maxval = 50,
+     group = groupFakeDown
+)
+
+fakeDownWickBodyRatio = input.float(
+     1.0,
+     "下影线/实体最小比例",
+     minval = 0.1,
+     step = 0.1,
+     group = groupFakeDown
+)
+
+fakeDownMinWickAtr = input.float(
+     0.15,
+     "最小下影线ATR倍数",
+     minval = 0.0,
+     step = 0.05,
+     group = groupFakeDown
+)
+
+fakeSupport = ta.lowest(low[1], fakeDownLookback)
+
+fakeSweptLow = low < fakeSupport
+fakeRecoveredClose = close > fakeSupport
+
+fakeLowerWickReject = lowerWick >= atr * fakeDownMinWickAtr and lowerWick >= bodySize * fakeDownWickBodyRatio
+
+int fakeDownBadCount = 0
+fakeDownBadCount += not volOk ? 1 : 0
+fakeDownBadCount += not atrOk ? 1 : 0
+fakeDownBadCount += oiSpikeBad ? 1 : 0
+fakeDownBadCount += fakeLowerWickReject ? 1 : 0
+
+fakeDownSetupRaw = showFakeBreakdown and isBTC and barstate.isconfirmed and
+     fakeSweptLow and
+     fakeRecoveredClose and
+     fakeDownBadCount >= fakeDownMinBadFactors
+
+fakeDownLevelRaw = fakeDownSetupRaw ? fakeSupport : na
+
+fakeDownInstant = fakeDownSetupRaw
+
+fakeDownConfirmed = fakeDownSetupRaw[fakeDownConfirmBars] and
+     not na(fakeDownLevelRaw[fakeDownConfirmBars]) and
+     close > fakeDownLevelRaw[fakeDownConfirmBars] and
+     high > high[fakeDownConfirmBars]
+
+var int lastFakeDownBar = na
+fakeDownCooldownOk = na(lastFakeDownBar) or bar_index - lastFakeDownBar > fakeDownCooldownBars
+
+fakeBreakdown = showFakeBreakdown and fakeDownCooldownOk and (
+     fakeDownMode == "即时" ? fakeDownInstant : fakeDownConfirmed
+)
+
+if fakeBreakdown
+    lastFakeDownBar := bar_index
+
+// ==========================
+// 12. 最终信号
+// ==========================
+
+// 多头信号
+wSignal = isBTC and barstate.isconfirmed and wBreakRaw and confirmPassed and trendOk
+compressionSignal = isBTC and barstate.isconfirmed and compressionBreakRaw and confirmPassed and trendOk
+
+anyLongSignal = wSignal or compressionSignal
+
+if wSignal
+    wReady := false
+    wNeckline := na
+
+// 空头信号
+mSignal = isBTC and barstate.isconfirmed and mBreakRaw and confirmPassedShort and trendDownOk and not fakeBreakdown
+compressionDownSignal = isBTC and barstate.isconfirmed and compressionDownBreakRaw and confirmPassedShort and trendDownOk and not fakeBreakdown
+
+anyShortSignal = mSignal or compressionDownSignal
+
+if mSignal
+    mReady := false
+    mNeckline := na
+
+// ==========================
+// 13. 图表显示：保持干净
+// ==========================
+
+// 多头关键线
+plot(
+     showLevels and wReady ? wNeckline : na,
+     "W底颈线",
+     color = color.new(color.orange, 0),
+     linewidth = 2
+)
+
+plot(
+     showLevels and compressionSetup ? compressionUpper : na,
+     "收敛上沿",
+     color = color.new(color.blue, 0),
+     linewidth = 2
+)
+
+// 空头关键线
+plot(
+     showLevels and mReady ? mNeckline : na,
+     "M顶颈线",
+     color = color.new(color.red, 0),
+     linewidth = 2
+)
+
+plot(
+     showLevels and compressionSetup ? compressionLower : na,
+     "收敛下沿",
+     color = color.new(color.purple, 0),
+     linewidth = 2
+)
+
+// 假突破/假跌破参考线，默认关闭
+plot(
+     showFakeReference ? fakeResistance : na,
+     "假突破前高参考",
+     color = color.new(color.red, 80),
+     linewidth = 1
+)
+
+plot(
+     showFakeReference ? fakeSupport : na,
+     "假跌破前低参考",
+     color = color.new(color.lime, 80),
+     linewidth = 1
+)
+
+// 多头标签
+plotshape(
+     wSignal,
+     title = "W底突破",
+     text = "W底突破",
+     style = shape.labelup,
+     location = location.belowbar,
+     color = color.new(color.lime, 0),
+     textcolor = color.black,
+     size = size.small
+)
+
+plotshape(
+     compressionSignal,
+     title = "收敛突破",
+     text = "收敛突破",
+     style = shape.labelup,
+     location = location.belowbar,
+     color = color.new(color.aqua, 0),
+     textcolor = color.black,
+     size = size.small
+)
+
+// 空头标签
+plotshape(
+     mSignal,
+     title = "M顶跌破",
+     text = "M顶跌破",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = color.new(color.red, 0),
+     textcolor = color.white,
+     size = size.small
+)
+
+plotshape(
+     compressionDownSignal,
+     title = "收敛跌破",
+     text = "收敛跌破",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = color.new(color.orange, 0),
+     textcolor = color.black,
+     size = size.small
+)
+
+// 假突破/假跌破标签
+plotshape(
+     fakeBreakout,
+     title = "假突破",
+     text = "假破",
+     style = shape.triangledown,
+     location = location.abovebar,
+     color = color.new(color.red, 0),
+     textcolor = color.white,
+     size = size.tiny
+)
+
+plotshape(
+     fakeBreakdown,
+     title = "假跌破",
+     text = "假跌",
+     style = shape.triangleup,
+     location = location.belowbar,
+     color = color.new(color.lime, 0),
+     textcolor = color.black,
+     size = size.tiny
+)
+
+// ==========================
+// 14. 状态面板，默认关闭
+// ==========================
+var table dash = table.new(position.top_right, 2, 12, border_width = 1)
+
+if barstate.islast and showTable
+    table.cell(dash, 0, 0, "BTC形态共振", text_color = color.white, bgcolor = color.new(color.black, 0))
+    table.cell(dash, 1, 0, "Final v1.5", text_color = color.white, bgcolor = color.new(color.black, 0))
+
+    table.cell(dash, 0, 1, "多头确认")
+    table.cell(dash, 1, 1, str.tostring(confirmScore) + "/" + str.tostring(confirmTotal))
+
+    table.cell(dash, 0, 2, "空头确认")
+    table.cell(dash, 1, 2, str.tostring(confirmScoreShort) + "/" + str.tostring(confirmTotalShort))
+
+    table.cell(dash, 0, 3, "成交量")
+    table.cell(dash, 1, 3, volOk ? "OK" : "NO")
+
+    table.cell(dash, 0, 4, "ATR")
+    table.cell(dash, 1, 4, atrOk ? "OK" : "NO")
+
+    table.cell(dash, 0, 5, "OI")
+    table.cell(dash, 1, 5, useOI ? (oiOk ? "OK" : "NO") : "OFF")
+
+    table.cell(dash, 0, 6, "W底状态")
+    table.cell(dash, 1, 6, wReady ? "等待突破" : "无")
+
+    table.cell(dash, 0, 7, "M顶状态")
+    table.cell(dash, 1, 7, mReady ? "等待跌破" : "无")
+
+    table.cell(dash, 0, 8, "收敛状态")
+    table.cell(dash, 1, 8, compressionSetup ? "等待突破/跌破" : "无")
+
+    table.cell(dash, 0, 9, "假突破")
+    table.cell(dash, 1, 9, fakeBreakout ? "出现" : "无")
+
+    table.cell(dash, 0, 10, "假跌破")
+    table.cell(dash, 1, 10, fakeBreakdown ? "出现" : "无")
+
+    table.cell(dash, 0, 11, "当前方向")
+    table.cell(dash, 1, 11, anyLongSignal ? "多头" : anyShortSignal ? "空头" : "等待")
+
+// ==========================
+// 15. 警报
+// ==========================
+
+// 多头警报
+alertcondition(
+     wSignal,
+     title = "BTC W底突破",
+     message = "BTC 出现 W底突破，且成交量/ATR/OI形成共振。"
+)
+
+alertcondition(
+     compressionSignal,
+     title = "BTC 收敛突破",
+     message = "BTC 出现收敛突破，且成交量/ATR/OI形成共振。"
+)
+
+alertcondition(
+     anyLongSignal,
+     title = "BTC 形态共振突破",
+     message = "BTC 出现形态共振突破信号：W底突破或收敛突破。"
+)
+
+// 空头警报
+alertcondition(
+     mSignal,
+     title = "BTC M顶跌破",
+     message = "BTC 出现 M顶跌破，且成交量/ATR/OI形成共振。"
+)
+
+alertcondition(
+     compressionDownSignal,
+     title = "BTC 收敛跌破",
+     message = "BTC 出现收敛跌破，且成交量/ATR/OI形成共振。"
+)
+
+alertcondition(
+     anyShortSignal,
+     title = "BTC 形态共振跌破",
+     message = "BTC 出现形态共振跌破信号：M顶跌破或收敛跌破。"
+)
+
+// 假信号警报
+alertcondition(
+     fakeBreakout,
+     title = "BTC 假突破",
+     message = "BTC 出现假突破：价格刺破前高后收回，且成交量/ATR/OI/上影线出现风险，注意诱多。"
+)
+
+alertcondition(
+     fakeBreakdown,
+     title = "BTC 假跌破",
+     message = "BTC 出现假跌破：价格刺破前低后收回，且成交量/ATR/OI/下影线出现风险，注意诱空。"
+)
